@@ -1,0 +1,4 @@
+{
+  "read": "/^polls\\//.test(resource.path)",
+  "write": "auth != null && (resource.openid == auth.uid || resource.openid == auth.openid) && resource.size <= 5242880"
+}

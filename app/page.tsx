@@ -14,14 +14,16 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-
-type Choice = 'yes' | 'maybe' | 'no';
-type Vote = { id: number; nickname: string; choice: Choice; comment: string; createdAt: number };
-type Poll = {
-  slug: string; title: string; price: string; description: string; question: string;
-  imageUrl: string; deadline: number | null; createdAt: number;
-  counts: Record<Choice, number>; total: number; votes: Vote[]; isOwner?: boolean;
-};
+import {
+  createPoll,
+  getPoll,
+  removePollVote,
+  submitPollVote,
+  uploadPollImage,
+  type Choice,
+  type ClientPoll as Poll,
+  type ClientVote as Vote,
+} from '@/lib/client-api';
 
 type ModelContext = {
   registerTool: (
@@ -108,11 +110,7 @@ export default function Home() {
     ownerKeyRef.current = ownerKey;
     if (!slug) return;
     setLoading(true);
-    fetch(`/api/polls/${encodeURIComponent(slug)}${ownerKey ? `?key=${encodeURIComponent(ownerKey)}` : ''}`)
-      .then(async (response) => {
-        if (!response.ok) throw new Error('这个咨询不存在或已删除');
-        return response.json() as Promise<Poll>;
-      })
+    getPoll(slug, ownerKey)
       .then(setPoll)
       .catch((error: Error) => setNotice(error.message))
       .finally(() => setLoading(false));
@@ -147,13 +145,13 @@ export default function Home() {
           const newVote: Vote = { id: Date.now(), nickname: value.nickname.trim(), choice, comment: value.comment?.trim() || '', createdAt: Date.now() };
           setPoll((current) => ({ ...current, total: current.total + 1, counts: { ...current.counts, [choice]: current.counts[choice] + 1 }, votes: [newVote, ...current.votes] }));
         } else {
-          const response = await fetch(`/api/polls/${encodeURIComponent(poll.slug)}/votes`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ choice, nickname: value.nickname.trim(), comment: value.comment?.trim() || '', guestToken: getGuestToken() }),
+          const updated = await submitPollVote(poll.slug, {
+            choice,
+            nickname: value.nickname.trim(),
+            comment: value.comment?.trim() || '',
+            guestToken: getGuestToken(),
           });
-          const body = await response.json();
-          if (!response.ok) throw new Error(body.error || '投票失败');
-          setPoll(body.poll);
+          setPoll(updated);
         }
         setNickname(value.nickname.trim()); setSelected(choice); setSubmittedChoice(choice);
         setNotice('收到，你的意见已记下');
@@ -179,13 +177,13 @@ export default function Home() {
     }
     setLoading(true);
     try {
-      const response = await fetch(`/api/polls/${encodeURIComponent(poll.slug)}/votes`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ choice: selected, nickname: nickname.trim(), comment: comment.trim(), guestToken: getGuestToken() }),
+      const updated = await submitPollVote(poll.slug, {
+        choice: selected,
+        nickname: nickname.trim(),
+        comment: comment.trim(),
+        guestToken: getGuestToken(),
       });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error || '投票失败，请重试');
-      setPoll(body.poll); setSubmittedChoice(selected); setComment(''); setNotice('收到，你的意见已记下');
+      setPoll(updated); setSubmittedChoice(selected); setComment(''); setNotice('收到，你的意见已记下');
     } catch (error) { setNotice(error instanceof Error ? error.message : '投票失败，请重试'); }
     finally { setLoading(false); }
   }
@@ -199,10 +197,14 @@ export default function Home() {
     } catch { /* Native share dismissal needs no error. */ }
   }
 
-  async function deleteVote(voteId: number) {
+  async function deleteVote(voteId: string | number) {
     if (!poll.isOwner || !ownerKeyRef.current) return;
-    const response = await fetch(`/api/polls/${encodeURIComponent(poll.slug)}/votes/${voteId}?key=${encodeURIComponent(ownerKeyRef.current)}`, { method: 'DELETE' });
-    if (response.ok) { const body = await response.json(); setPoll(body.poll); setNotice('这条留言已删除'); }
+    try {
+      const updated = await removePollVote(poll.slug, voteId, ownerKeyRef.current);
+      setPoll(updated); setNotice('这条留言已删除');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '删除失败，请重试');
+    }
   }
 
   return (
@@ -284,18 +286,15 @@ function Results({ poll, percentages, onEdit }: { poll: Poll; percentages: Recor
 function CreateDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [submitting, setSubmitting] = useState(false); const [preview, setPreview] = useState(''); const [error, setError] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
-  async function createPoll(event: FormEvent<HTMLFormElement>) {
+  async function handleCreatePoll(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const data = new FormData(event.currentTarget); setSubmitting(true); setError('');
     try {
       let imageKey = ''; const file = data.get('image');
       if (file instanceof File && file.size > 0) {
-        const upload = new FormData(); upload.set('image', file);
-        const uploadResponse = await fetch('/api/uploads', { method: 'POST', body: upload }); const uploadBody = await uploadResponse.json();
-        if (!uploadResponse.ok) throw new Error(uploadBody.error || '图片上传失败'); imageKey = uploadBody.key;
+        imageKey = await uploadPollImage(file);
       }
       const deadlineDays = Number(data.get('deadlineDays') || 3);
-      const response = await fetch('/api/polls', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: data.get('title'), price: data.get('price'), description: data.get('description'), question: data.get('question') || '如果是你，你会买吗？', imageKey, deadline: Date.now() + deadlineDays * 86400000 }) });
-      const body = await response.json(); if (!response.ok) throw new Error(body.error || '创建失败');
+      const body = await createPoll({ title: data.get('title'), price: data.get('price'), description: data.get('description'), question: data.get('question') || '如果是你，你会买吗？', imageKey, deadline: Date.now() + deadlineDays * 86400000 });
       window.location.href = `/?p=${encodeURIComponent(body.slug)}&key=${encodeURIComponent(body.ownerKey)}`;
     } catch (caught) { setError(caught instanceof Error ? caught.message : '创建失败，请重试'); setSubmitting(false); }
   }
@@ -303,7 +302,7 @@ function CreateDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (op
     <DialogTrigger render={<Button className="create-button" />}><Plus aria-hidden="true" /> 发起新咨询</DialogTrigger>
     <DialogContent className="create-dialog">
       <DialogHeader><span className="dialog-icon"><ShoppingBag aria-hidden="true" /></span><DialogTitle>有东西拿不定主意？</DialogTitle><DialogDescription>把它发给朋友，听听大家的真实想法。</DialogDescription></DialogHeader>
-      <form className="create-form" onSubmit={createPoll}>
+      <form className="create-form" onSubmit={handleCreatePoll}>
         <button type="button" className={`image-picker ${preview ? 'has-image' : ''}`} onClick={() => fileRef.current?.click()}>{preview ? <img src={preview} alt="待购物品预览" /> : <><ImagePlus aria-hidden="true" /><span>上传物品图片</span><small>JPG、PNG 或 WebP，最大 5MB</small></>}</button>
         <input ref={fileRef} className="sr-only" type="file" name="image" accept="image/jpeg,image/png,image/webp" onChange={(event) => { const file = event.target.files?.[0]; if (file) setPreview(URL.createObjectURL(file)); }} />
         <label><span>你在纠结什么？</span><Input name="title" required maxLength={80} placeholder="例如：这副头戴式耳机值得买吗？" /></label>
